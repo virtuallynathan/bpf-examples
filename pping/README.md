@@ -37,7 +37,7 @@ echo identifer, and thus all instaces of ping originating from a particular
 Windows host and the same target host will be considered a single flow.
 
 ## Output formats
-pping currently supports 3 different formats, *standard*, *ppviz* and *json*. In
+pping currently supports 4 different formats, *standard*, *ppviz*, *json*, and *jsonl*. In
 general, the output consists of two different types of events, flow-events which
 gives information that a flow has started/ended, and RTT-events which provides
 information on a computed RTT within a flow.
@@ -115,6 +115,45 @@ An example of a (pretty-printed) RTT-even is provided below:
     "sent_packets": 9393,
     "sent_bytes": 492457296,
     "rec_packets": 5922,
+    "rec_bytes": 37,
+    "match_on_egress": false
+}
+```
+
+### JSON Lines (jsonl) format
+The JSON Lines (jsonl) format is similar to the JSON format, but instead of a single JSON array containing all event objects, it outputs each event or aggregated statistic as a separate JSON object on a new line. This format can be more convenient for stream processing as each line is a valid JSON object.
+
+An example of a (pretty-printed) RTT-event in jsonl format would be identical to the JSON example for a single event, but each subsequent event would appear on a new line:
+```json
+{
+    "timestamp": 1623420838254558500,
+    "src_ip": "10.11.1.1",
+    "src_port": 5201,
+    "dest_ip": "10.11.1.2",
+    "dest_port": 59572,
+    "protocol": "TCP",
+    "rtt": 5977708,
+    "min_rtt": 5441848,
+    "sent_packets": 9393,
+    "sent_bytes": 492457296,
+    "rec_packets": 5922,
+    "rec_bytes": 37,
+    "match_on_egress": false
+}
+```
+```json
+{
+    "timestamp": 1623420839254558500,
+    "src_ip": "10.11.1.1",
+    "src_port": 5201,
+    "dest_ip": "10.11.1.2",
+    "dest_port": 59572,
+    "protocol": "TCP",
+    "rtt": 6000000,
+    "min_rtt": 5441848,
+    "sent_packets": 9394,
+    "sent_bytes": 492457350,
+    "rec_packets": 5923,
     "rec_bytes": 37,
     "match_on_egress": false
 }

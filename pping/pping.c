@@ -73,7 +73,8 @@ static const char *__doc__ =
 enum pping_output_format {
 	PPING_OUTPUT_STANDARD,
 	PPING_OUTPUT_JSON,
-	PPING_OUTPUT_PPVIZ
+	PPING_OUTPUT_PPVIZ,
+	PPING_OUTPUT_JSONL
 };
 
 /*
@@ -356,9 +357,11 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 				config->format = PPING_OUTPUT_JSON;
 			} else if (strcmp(optarg, "ppviz") == 0) {
 				config->format = PPING_OUTPUT_PPVIZ;
+			} else if (strcmp(optarg, "jsonl") == 0) {
+				config->format = PPING_OUTPUT_JSONL;
 			} else {
 				fprintf(stderr,
-					"format must be \"standard\", \"json\" or \"ppviz\"\n");
+					"format must be \"standard\", \"json\", \"ppviz\" or \"jsonl\"\n");
 				return -EINVAL;
 			}
 			break;
@@ -492,6 +495,8 @@ const char *output_format_to_str(enum pping_output_format format)
 		return "json";
 	case PPING_OUTPUT_PPVIZ:
 		return "ppviz";
+	case PPING_OUTPUT_JSONL:
+		return "jsonl";
 	default:
 		return "unkown format";
 	}
@@ -1059,18 +1064,23 @@ static void print_flowevent_fields_json(json_writer_t *ctx,
 	jsonw_string_field(ctx, "triggered_by", eventsource_to_str(fe->source));
 }
 
-static void print_event_json(json_writer_t *jctx, const union pping_event *e)
+static void print_event_json(struct output_context *out_ctx, const union pping_event *e)
 {
 	if (e->event_type != EVENT_TYPE_RTT && e->event_type != EVENT_TYPE_FLOW)
 		return;
 
-	jsonw_start_object(jctx);
-	print_common_fields_json(jctx, e);
+	jsonw_start_object(out_ctx->jctx);
+	print_common_fields_json(out_ctx->jctx, e);
 	if (e->event_type == EVENT_TYPE_RTT)
-		print_rttevent_fields_json(jctx, &e->rtt_event);
+		print_rttevent_fields_json(out_ctx->jctx, &e->rtt_event);
 	else // flow-event
-		print_flowevent_fields_json(jctx, &e->flow_event);
-	jsonw_end_object(jctx);
+		print_flowevent_fields_json(out_ctx->jctx, &e->flow_event);
+	jsonw_end_object(out_ctx->jctx);
+
+	if (out_ctx->format == PPING_OUTPUT_JSONL) {
+		fprintf(out_ctx->stream, "\n");
+		fflush(out_ctx->stream);
+	}
 }
 
 static void print_event(struct output_context *out_ctx,
@@ -1084,8 +1094,9 @@ static void print_event(struct output_context *out_ctx,
 		print_event_standard(out_ctx->stream, pe);
 		break;
 	case PPING_OUTPUT_JSON:
+	case PPING_OUTPUT_JSONL:
 		if (out_ctx->jctx)
-			print_event_json(out_ctx->jctx, pe);
+			print_event_json(out_ctx, pe);
 		break;
 	case PPING_OUTPUT_PPVIZ:
 		print_event_ppviz(out_ctx->stream, pe);
@@ -1309,10 +1320,11 @@ static void print_ppingerrors_json(json_writer_t *jctx,
 	jsonw_end_object(jctx);
 }
 
-static void print_globalcounters_json(json_writer_t *jctx, __u64 t_monotonic,
+static void print_globalcounters_json(struct output_context *out_ctx, __u64 t_monotonic,
 				      const struct global_counters *counters)
 {
 	char protostr[16];
+	json_writer_t *jctx = out_ctx->jctx;
 	int proto;
 
 	jsonw_start_object(jctx);
@@ -1351,6 +1363,11 @@ static void print_globalcounters_json(json_writer_t *jctx, __u64 t_monotonic,
 	print_ppingerrors_json(jctx, &counters->err);
 
 	jsonw_end_object(jctx);
+
+	if (out_ctx->format == PPING_OUTPUT_JSONL) {
+		fprintf(out_ctx->stream, "\n");
+		fflush(out_ctx->stream);
+	}
 }
 
 static void print_globalcounters(struct output_context *out_ctx,
@@ -1360,8 +1377,9 @@ static void print_globalcounters(struct output_context *out_ctx,
 	if (out_ctx->format == PPING_OUTPUT_STANDARD)
 		print_globalcounters_standard(out_ctx->stream, t_monotonic,
 					      counters);
-	else if (out_ctx->jctx)
-		print_globalcounters_json(out_ctx->jctx, t_monotonic, counters);
+	else if (out_ctx->format == PPING_OUTPUT_JSON || out_ctx->format == PPING_OUTPUT_JSONL)
+		if (out_ctx->jctx)
+			print_globalcounters_json(out_ctx, t_monotonic, counters);
 }
 
 static void update_ecncounters(struct ecn_counters *to,
@@ -1594,21 +1612,26 @@ static void print_aggmetadata_standard(FILE *stream,
 		(double)agg_conf->aggregation_interval / NS_PER_SECOND);
 }
 
-static void print_aggmetadata_json(json_writer_t *ctx,
+static void print_aggmetadata_json(struct output_context *out_ctx,
 				   struct aggregation_config *agg_conf)
 {
-	jsonw_start_object(ctx);
+	json_writer_t *jctx = out_ctx->jctx;
+	jsonw_start_object(jctx);
 
-	jsonw_u64_field(ctx, "timestamp", get_time_ns(CLOCK_REALTIME));
-	jsonw_u64_field(ctx, "bins", agg_conf->n_bins);
-	jsonw_u64_field(ctx, "bin_width_ns", agg_conf->bin_width);
-	jsonw_u64_field(ctx, "aggregation_interval_ns",
+	jsonw_u64_field(jctx, "timestamp", get_time_ns(CLOCK_REALTIME));
+	jsonw_u64_field(jctx, "bins", agg_conf->n_bins);
+	jsonw_u64_field(jctx, "bin_width_ns", agg_conf->bin_width);
+	jsonw_u64_field(jctx, "aggregation_interval_ns",
 			agg_conf->aggregation_interval);
-	jsonw_u64_field(ctx, "timeout_interval_ns", agg_conf->timeout_interval);
-	jsonw_uint_field(ctx, "ipv4_prefix_len", agg_conf->ipv4_prefix_len);
-	jsonw_uint_field(ctx, "ipv6_prefix_len", agg_conf->ipv6_prefix_len);
+	jsonw_u64_field(jctx, "timeout_interval_ns", agg_conf->timeout_interval);
+	jsonw_uint_field(jctx, "ipv4_prefix_len", agg_conf->ipv4_prefix_len);
+	jsonw_uint_field(jctx, "ipv6_prefix_len", agg_conf->ipv6_prefix_len);
 
-	jsonw_end_object(ctx);
+	jsonw_end_object(jctx);
+	if (out_ctx->format == PPING_OUTPUT_JSONL) {
+		fprintf(out_ctx->stream, "\n");
+		fflush(out_ctx->stream);
+	}
 }
 
 static void print_aggmetadata(struct output_context *out_ctx,
@@ -1619,8 +1642,9 @@ static void print_aggmetadata(struct output_context *out_ctx,
 
 	if (out_ctx->format == PPING_OUTPUT_STANDARD)
 		print_aggmetadata_standard(out_ctx->stream, agg_conf);
-	else if (out_ctx->jctx)
-		print_aggmetadata_json(out_ctx->jctx, agg_conf);
+	else if (out_ctx->format == PPING_OUTPUT_JSON || out_ctx->format == PPING_OUTPUT_JSONL)
+		if (out_ctx->jctx)
+			print_aggmetadata_json(out_ctx, agg_conf);
 }
 
 static void print_aggstats_standard(FILE *stream, __u64 t,
@@ -1669,45 +1693,50 @@ static void print_trafficcount_json(json_writer_t *jctx,
 	jsonw_end_object(jctx);
 }
 
-static void print_aggstats_json(json_writer_t *ctx, __u64 t,
+static void print_aggstats_json(struct output_context *out_ctx, __u64 t,
 				const char *prefixstr,
 				struct aggregated_stats *stats,
 				struct aggregation_config *agg_conf)
 {
+	json_writer_t *jctx = out_ctx->jctx;
 	__u64 bw = agg_conf->bin_width;
 	__u64 nb = aggregated_stats_maxbins(stats, bw, agg_conf->n_bins);
 	int i;
 
-	jsonw_start_object(ctx);
-	jsonw_u64_field(ctx, "timestamp", convert_monotonic_to_realtime(t));
-	jsonw_string_field(ctx, "ip_prefix", prefixstr);
+	jsonw_start_object(jctx);
+	jsonw_u64_field(jctx, "timestamp", convert_monotonic_to_realtime(t));
+	jsonw_string_field(jctx, "ip_prefix", prefixstr);
 
-	jsonw_name(ctx, "rx_stats");
-	print_trafficcount_json(ctx, &stats->rx_stats);
-	jsonw_name(ctx, "tx_stats");
-	print_trafficcount_json(ctx, &stats->tx_stats);
+	jsonw_name(jctx, "rx_stats");
+	print_trafficcount_json(jctx, &stats->rx_stats);
+	jsonw_name(jctx, "tx_stats");
+	print_trafficcount_json(jctx, &stats->tx_stats);
 
 	if (aggregated_stats_nortts(stats))
 		goto exit;
 
-	jsonw_u64_field(ctx, "count_rtt", lhist_count(stats->rtt_bins, nb));
-	jsonw_u64_field(ctx, "min_rtt", stats->rtt_min);
-	jsonw_float_field(ctx, "mean_rtt",
+	jsonw_u64_field(jctx, "count_rtt", lhist_count(stats->rtt_bins, nb));
+	jsonw_u64_field(jctx, "min_rtt", stats->rtt_min);
+	jsonw_float_field(jctx, "mean_rtt",
 			  lhist_mean(stats->rtt_bins, nb, bw, 0));
-	jsonw_float_field(ctx, "median_rtt",
+	jsonw_float_field(jctx, "median_rtt",
 			  lhist_percentile(stats->rtt_bins, 50, nb, bw, 0));
-	jsonw_float_field(ctx, "p95_rtt",
+	jsonw_float_field(jctx, "p95_rtt",
 			  lhist_percentile(stats->rtt_bins, 95, nb, bw, 0));
-	jsonw_u64_field(ctx, "max_rtt", stats->rtt_max);
+	jsonw_u64_field(jctx, "max_rtt", stats->rtt_max);
 
-	jsonw_name(ctx, "histogram");
-	jsonw_start_array(ctx);
+	jsonw_name(jctx, "histogram");
+	jsonw_start_array(jctx);
 	for (i = 0; i < nb; i++)
-		jsonw_uint(ctx, stats->rtt_bins[i]);
-	jsonw_end_array(ctx);
+		jsonw_uint(jctx, stats->rtt_bins[i]);
+	jsonw_end_array(jctx);
 
 exit:
-	jsonw_end_object(ctx);
+	jsonw_end_object(jctx);
+	if (out_ctx->format == PPING_OUTPUT_JSONL) {
+		fprintf(out_ctx->stream, "\n");
+		fflush(out_ctx->stream);
+	}
 }
 
 static void print_aggregated_stats(struct output_context *out_ctx, __u64 t,
@@ -1726,9 +1755,10 @@ static void print_aggregated_stats(struct output_context *out_ctx, __u64 t,
 	if (out_ctx->format == PPING_OUTPUT_STANDARD)
 		print_aggstats_standard(out_ctx->stream, t, prefixstr, stats,
 					agg_conf);
-	else if (out_ctx->jctx)
-		print_aggstats_json(out_ctx->jctx, t, prefixstr, stats,
-				    agg_conf);
+	else if (out_ctx->format == PPING_OUTPUT_JSON || out_ctx->format == PPING_OUTPUT_JSONL)
+		if (out_ctx->jctx)
+			print_aggstats_json(out_ctx, t, prefixstr, stats,
+					    agg_conf);
 }
 
 // Stolen from BPF selftests
@@ -2106,11 +2136,13 @@ static struct output_context *open_output(const char *filename,
 		out_ctx->stream = stdout;
 	}
 
-	if (out_ctx->format == PPING_OUTPUT_JSON) {
+	if (out_ctx->format == PPING_OUTPUT_JSON || out_ctx->format == PPING_OUTPUT_JSONL) {
 		out_ctx->jctx = jsonw_new(out_ctx->stream);
 		if (!out_ctx->jctx)
 			goto err;
-		jsonw_start_array(out_ctx->jctx);
+		if (out_ctx->format == PPING_OUTPUT_JSON) { // Only start array for regular JSON
+			jsonw_start_array(out_ctx->jctx);
+		}
 	}
 
 	if (agg_conf)
@@ -2127,7 +2159,9 @@ static int close_output(struct output_context *out_ctx)
 	int err = 0;
 
 	if (out_ctx->jctx) {
-		jsonw_end_array(out_ctx->jctx);
+		if (out_ctx->format == PPING_OUTPUT_JSON) { // Only end array for regular JSON
+			jsonw_end_array(out_ctx->jctx);
+		}
 		jsonw_destroy(&out_ctx->jctx);
 	}
 
