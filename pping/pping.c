@@ -1080,6 +1080,7 @@ static void print_event_json(struct output_context *out_ctx, const union pping_e
 	if (out_ctx->format == PPING_OUTPUT_JSONL) {
 		fprintf(out_ctx->stream, "\n");
 		fflush(out_ctx->stream);
+		jsonw_reset_sep(out_ctx->jctx);
 	}
 }
 
@@ -1367,6 +1368,7 @@ static void print_globalcounters_json(struct output_context *out_ctx, __u64 t_mo
 	if (out_ctx->format == PPING_OUTPUT_JSONL) {
 		fprintf(out_ctx->stream, "\n");
 		fflush(out_ctx->stream);
+		jsonw_reset_sep(out_ctx->jctx);
 	}
 }
 
@@ -1631,6 +1633,7 @@ static void print_aggmetadata_json(struct output_context *out_ctx,
 	if (out_ctx->format == PPING_OUTPUT_JSONL) {
 		fprintf(out_ctx->stream, "\n");
 		fflush(out_ctx->stream);
+		jsonw_reset_sep(out_ctx->jctx);
 	}
 }
 
@@ -1736,6 +1739,7 @@ exit:
 	if (out_ctx->format == PPING_OUTPUT_JSONL) {
 		fprintf(out_ctx->stream, "\n");
 		fflush(out_ctx->stream);
+		jsonw_reset_sep(out_ctx->jctx);
 	}
 }
 

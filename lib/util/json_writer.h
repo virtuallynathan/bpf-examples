@@ -76,4 +76,7 @@ void jsonw_end_array(json_writer_t *self);
 /* Override default exception handling */
 typedef void (jsonw_err_handler_fn)(const char *);
 
+/* Reset separator, useful for JSONL to avoid leading comma on next object */
+void jsonw_reset_sep(json_writer_t *self);
+
 #endif /* _JSON_WRITER_H_ */

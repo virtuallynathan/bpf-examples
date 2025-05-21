@@ -342,6 +342,13 @@ void jsonw_null_field(json_writer_t *self, const char *prop)
 	jsonw_null(self);
 }
 
+void jsonw_reset_sep(json_writer_t *self)
+{
+	if (self) {
+		self->sep = '\0';
+	}
+}
+
 #ifdef TEST
 int main(int argc, char **argv)
 {
