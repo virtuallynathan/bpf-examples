@@ -1727,6 +1727,10 @@ static void print_aggstats_standard(FILE *stream, __u64 t,
 		lhist_percentile(stats->rtt_bins, 95, nb, bw, 0) / NS_PER_MS,
 		(double)stats->rtt_max / NS_PER_MS);
 
+	if (stats->quic_spin_set_count > 0) {
+		fprintf(stream, ", quic_spin1_pkts=%llu", stats->quic_spin_set_count);
+	}
+
 exit:
 	fprintf(stream, "\n");
 }
@@ -1782,6 +1786,10 @@ static void print_aggstats_json(struct output_context *out_ctx, __u64 t,
 	for (i = 0; i < nb; i++)
 		jsonw_uint(jctx, stats->rtt_bins[i]);
 	jsonw_end_array(jctx);
+
+	if (stats->quic_spin_set_count > 0) {
+		jsonw_u64_field(jctx, "quic_spin1_packets", stats->quic_spin_set_count);
+	}
 
 exit:
 	jsonw_end_object(jctx);

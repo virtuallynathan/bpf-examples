@@ -308,6 +308,7 @@ struct aggregated_stats {
 	__u64 rtt_min;
 	__u64 rtt_max;
 	__u32 rtt_bins[RTT_AGG_NR_BINS];
+	__u64 quic_spin_set_count; // Counter for QUIC spin bit set to 1 events
 };
 
 struct ecn_counters {

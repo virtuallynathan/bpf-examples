@@ -1352,6 +1352,11 @@ static void update_subnet_pktcnt(struct aggregated_stats *stats,
 	}
 
 	stats->last_updated = p_info->time;
+
+	// Increment QUIC spin bit set counter if applicable
+	if (config.track_quic && config.agg_rtts && p_info->is_quic && p_info->quic_spin_bit == 1) {
+		stats->quic_spin_set_count++;
+	}
 }
 
 static void update_aggregate_stats(struct aggregated_stats **src_stats,

@@ -136,5 +136,118 @@ if [ "$TEST_FAILED" -eq 0 ]; then
     exit 0
 else
     echo "QUIC output smoke test FAILED."
+    # Do not exit yet, proceed to Scenario 2
+    # exit 1 
+fi
+
+# --- Scenario 2: QUIC Tracking with Aggregation Enabled ---
+echo
+echo "Running Scenario 2: QUIC Tracking with Aggregation Enabled..."
+TMP_QUIC_AGG_OUT="$SCRIPT_DIR/output_quic_agg.txt"
+TMP_QUIC_AGG_STDERR="$SCRIPT_DIR/stderr_quic_agg.txt"
+# Add these to cleanup
+trap 'rm -f "$TMP_QUIC_OUT" "$TMP_QUIC_STDERR" "$SCRIPT_DIR/lines_quic.tmp" "$TMP_QUIC_AGG_OUT" "$TMP_QUIC_AGG_STDERR" "$SCRIPT_DIR/lines_quic_agg.tmp"; echo "Cleaning up all temporary files...";' EXIT
+
+
+# Run pping for 3 seconds with --quic and 1s aggregation. -c 0 disables map cleanup.
+(cd "$PPING_DIR" && sudo "./$PPING_EXEC_NAME" -i lo --quic -a 1 --format jsonl -c 0 > "$TMP_QUIC_AGG_OUT" 2> "$TMP_QUIC_AGG_STDERR") &
+PPING_PID=$!
+sleep 3 # Allow for at least 2 aggregation intervals + metadata
+if ps -p $PPING_PID > /dev/null; then
+   sudo kill $PPING_PID || true
+else
+   echo "Scenario 2: pping process $PPING_PID already exited."
+fi
+wait $PPING_PID || true
+
+echo "Validating Scenario 2 stderr for QUIC tracking and aggregation messages ($TMP_QUIC_AGG_STDERR)..."
+SCENARIO2_STDERR_OK=1
+if ! grep -q "tracking .*QUIC" "$TMP_QUIC_AGG_STDERR"; then
+    echo "Scenario 2 Stderr check FAILED: Did not find 'tracking QUIC' message."
+    SCENARIO2_STDERR_OK=0
+fi
+if ! grep -q "Aggregating RTTs" "$TMP_QUIC_AGG_STDERR"; then # Check for a generic aggregation message
+    echo "Scenario 2 Stderr check FAILED: Did not find aggregation message."
+    SCENARIO2_STDERR_OK=0
+fi
+
+if [ "$SCENARIO2_STDERR_OK" -eq 1 ]; then
+    echo "Scenario 2 Stderr checks PASSED."
+else
+    cat "$TMP_QUIC_AGG_STDERR"
+    TEST_FAILED=1
+fi
+
+
+echo "Validating Scenario 2 JSONL output ($TMP_QUIC_AGG_OUT)..."
+if [ ! -s "$TMP_QUIC_AGG_OUT" ]; then
+    echo "Warning: $TMP_QUIC_AGG_OUT is empty. Aggregated QUIC pping run might have issues or no events generated."
+    # This is not a failure for this smoke test if stderr checks passed for startup.
+fi
+
+FIRST_CHAR_QUIC_AGG_OUT=$(head -c 1 "$TMP_QUIC_AGG_OUT" 2>/dev/null || true)
+if [ -s "$TMP_QUIC_AGG_OUT" ] && [ "$FIRST_CHAR_QUIC_AGG_OUT" == "[" ]; then
+    echo "Error: $TMP_QUIC_AGG_OUT appears to be a JSON array, not JSONL."
+    TEST_FAILED=1
+fi
+
+LINE_COUNT_QUIC_AGG=0
+HAS_AGG_METADATA=0
+HAS_AGG_STATS=0      # For subnet stats
+HAS_GLOBAL_COUNTERS=0 # For global counters typically printed with aggregation
+
+# Use a temporary file for lines to avoid issues with process substitution and loops
+grep -v '^$' "$TMP_QUIC_AGG_OUT" > "$SCRIPT_DIR/lines_quic_agg.tmp" || true
+
+if [ -s "$SCRIPT_DIR/lines_quic_agg.tmp" ]; then
+    while IFS= read -r line; do
+        if [ -z "$line" ]; then
+            continue
+        fi
+        LINE_COUNT_QUIC_AGG=$((LINE_COUNT_QUIC_AGG + 1))
+        if ! echo "$line" | jq -e . > /dev/null; then
+            echo "Invalid JSON line in $TMP_QUIC_AGG_OUT (line $LINE_COUNT_QUIC_AGG): $line"
+            TEST_FAILED=1
+            break
+        fi
+        # Check for different types of expected aggregation lines
+        if echo "$line" | jq -e '.aggregation_interval_ns' > /dev/null; then
+            HAS_AGG_METADATA=1
+        elif echo "$line" | jq -e '.ip_prefix and .rx_stats and .tx_stats' > /dev/null; then
+            HAS_AGG_STATS=1
+            # Opportunistically check for quic_spin1_packets, but its absence is not a failure
+            if echo "$line" | jq -e '.quic_spin1_packets' > /dev/null; then
+                echo "Found 'quic_spin1_packets' field in an aggregated stats line."
+            fi
+        elif echo "$line" | jq -e '.protocol_counters and .ecn_counters' > /dev/null; then
+            HAS_GLOBAL_COUNTERS=1
+        fi
+    done < "$SCRIPT_DIR/lines_quic_agg.tmp"
+fi
+rm -f "$SCRIPT_DIR/lines_quic_agg.tmp"
+
+if [ "$TEST_FAILED" -eq 0 ]; then
+    echo "Scenario 2: JSONL (QUIC with aggregation) basic validation passed ($LINE_COUNT_QUIC_AGG lines processed)."
+    if [ "$LINE_COUNT_QUIC_AGG" -gt 0 ]; then # Only print these if there was some output
+        echo "Found aggregation metadata: $HAS_AGG_METADATA"
+        echo "Found aggregated stats lines: $HAS_AGG_STATS"
+        echo "Found global counters lines: $HAS_GLOBAL_COUNTERS"
+        if [ "$HAS_AGG_METADATA" -eq 0 ] && [ "$HAS_AGG_STATS" -eq 0 ] && [ "$HAS_GLOBAL_COUNTERS" -eq 0 ]; then
+             echo "Warning: No standard aggregation output lines (metadata, stats, counters) found, though output file was not empty."
+        fi
+    fi
+else
+    echo "Scenario 2: JSONL (QUIC with aggregation) basic validation FAILED."
+fi
+echo "--- End of Scenario 2 ---"
+echo
+
+
+# Final Exit Status
+if [ "$TEST_FAILED" -eq 0 ]; then
+    echo "All QUIC output tests passed!"
+    exit 0
+else
+    echo "One or more QUIC output tests FAILED."
     exit 1
 fi
