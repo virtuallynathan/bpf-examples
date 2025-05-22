@@ -2638,8 +2638,9 @@ int main(int argc, char *argv[])
 	struct perf_buffer *pb = NULL;
 	int epfd, sigfd, aggfd;
 
-	// DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_ingress_opts); // Moved into global_config_for_handlers init
-	// DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_egress_opts); // Moved into global_config_for_handlers init
+    // Declare tc_opts variables here, before global_config_for_handlers is defined
+    DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_ingress_opts);
+    DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_egress_opts);
 
 	// Initialize global_config_for_handlers. Some fields will be set by parse_arguments.
 	// This makes it available to handlers like handle_event via the perf_buffer context.
@@ -2684,16 +2685,11 @@ int main(int argc, char *argv[])
 		.packet_map = "packet_ts",
 		.flow_map = "flow_state",
 		.event_map = "events",
-		.tc_ingress_opts = {0}, // Initialize with DECLARE_LIBBPF_OPTS style if needed, or ensure it's correctly setup
-		.tc_egress_opts = {0},  // Same here
+		.tc_ingress_opts = tc_ingress_opts, // Use the variable defined by DECLARE_LIBBPF_OPTS
+		.tc_egress_opts = tc_egress_opts,   // Use the variable defined by DECLARE_LIBBPF_OPTS
 		.xdp_mode = XDP_MODE_NATIVE,
 	};
-	// Properly initialize tc_opts using the macro
-	DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_ingress_opts_val);
-	global_config_for_handlers.tc_ingress_opts = tc_ingress_opts_val;
-	DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_egress_opts_val);
-	global_config_for_handlers.tc_egress_opts = tc_egress_opts_val;
-
+	// The assignments like global_config_for_handlers.tc_ingress_opts = tc_ingress_opts_val; are no longer needed here.
 
 	// Detect if running as root
 	if (geteuid() != 0) {
