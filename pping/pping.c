@@ -1301,6 +1301,8 @@ print_globalcounters_standard(FILE *stream, __u64 t_monotonic,
 				      counters->icmp_bytes, &first);
 	print_pktbytes_tuple_standard(stream, "ICMPv6", counters->icmp6_pkts,
 				      counters->icmp6_bytes, &first);
+	print_pktbytes_tuple_standard(stream, "QUIC", counters->quic_pkts,
+				      counters->quic_bytes, &first);
 
 	for (proto = 0; proto < N_IPPROTOS; proto++) {
 		if (counters->other_ipprotos[proto] > 0) { // Check to avoid uncecessary ipproto_to_str
@@ -1394,6 +1396,8 @@ static void print_globalcounters_json(struct output_context *out_ctx, __u64 t_mo
 				  counters->icmp_bytes);
 	print_pktbytes_tuple_json(jctx, "ICMPv6", counters->icmp6_pkts,
 				  counters->icmp6_bytes);
+	print_pktbytes_tuple_json(jctx, "QUIC", counters->quic_pkts,
+				  counters->quic_bytes);
 
 	for (proto = 0; proto < N_IPPROTOS; proto++) {
 		if (counters->other_ipprotos[proto] > 0) {
@@ -1465,6 +1469,8 @@ static void update_globalcounters(struct global_counters *to,
 	to->icmp_bytes += from->icmp_bytes;
 	to->icmp6_pkts += from->icmp6_pkts;
 	to->icmp6_bytes += from->icmp6_bytes;
+	to->quic_pkts += from->quic_pkts;
+	to->quic_bytes += from->quic_bytes;
 
 	for (proto = 0; proto < N_IPPROTOS; proto++) {
 		to->other_ipprotos[proto] += from->other_ipprotos[proto];
@@ -1523,6 +1529,8 @@ static void diff_globalcounters(struct global_counters *diff,
 	diff->icmp_bytes = next->icmp_bytes - prev->icmp_bytes;
 	diff->icmp6_pkts = next->icmp6_pkts - prev->icmp6_pkts;
 	diff->icmp6_bytes = next->icmp6_bytes - prev->icmp6_bytes;
+	diff->quic_pkts = next->quic_pkts - prev->quic_pkts;
+	diff->quic_bytes = next->quic_bytes - prev->quic_bytes;
 
 	for (proto = 0; proto < N_IPPROTOS; proto++) {
 		diff->other_ipprotos[proto] = next->other_ipprotos[proto] -

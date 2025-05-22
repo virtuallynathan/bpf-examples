@@ -195,6 +195,7 @@ LINE_COUNT_QUIC_AGG=0
 HAS_AGG_METADATA=0
 HAS_AGG_STATS=0      # For subnet stats
 HAS_GLOBAL_COUNTERS=0 # For global counters typically printed with aggregation
+HAS_GLOBAL_QUIC_FIELDS=0 # Specifically for quic_pkts and quic_bytes in global counters
 
 # Use a temporary file for lines to avoid issues with process substitution and loops
 grep -v '^$' "$TMP_QUIC_AGG_OUT" > "$SCRIPT_DIR/lines_quic_agg.tmp" || true
@@ -219,8 +220,19 @@ if [ -s "$SCRIPT_DIR/lines_quic_agg.tmp" ]; then
             if echo "$line" | jq -e '.quic_spin1_packets' > /dev/null; then
                 echo "Found 'quic_spin1_packets' field in an aggregated stats line."
             fi
-        elif echo "$line" | jq -e '.protocol_counters and .ecn_counters' > /dev/null; then
+        elif echo "$line" | jq -e '.protocol_counters and .ecn_counters' > /dev/null; then # This identifies a global counters line
             HAS_GLOBAL_COUNTERS=1
+            # Now check for the presence of quic_pkts and quic_bytes within .protocol_counters
+            if echo "$line" | jq -e '.protocol_counters | has("quic_pkts") and has("quic_bytes")' > /dev/null; then
+                HAS_GLOBAL_QUIC_FIELDS=1
+                echo "Found 'quic_pkts' and 'quic_bytes' in global counters."
+            else
+                # If this is a global counters line but doesn't have the QUIC fields, it's an error
+                # (assuming --quic means they should always be present, even if zero)
+                echo "Error: Global counters line identified, but 'quic_pkts' or 'quic_bytes' are missing from .protocol_counters."
+                echo "Line content: $line"
+                TEST_FAILED=1
+            fi
         fi
     done < "$SCRIPT_DIR/lines_quic_agg.tmp"
 fi
@@ -232,6 +244,14 @@ if [ "$TEST_FAILED" -eq 0 ]; then
         echo "Found aggregation metadata: $HAS_AGG_METADATA"
         echo "Found aggregated stats lines: $HAS_AGG_STATS"
         echo "Found global counters lines: $HAS_GLOBAL_COUNTERS"
+        if [ "$HAS_GLOBAL_COUNTERS" -gt 0 ] && [ "$HAS_GLOBAL_QUIC_FIELDS" -eq 0 ]; then
+            echo "Error: Global counters lines were found, but they did not contain the expected 'quic_pkts' and 'quic_bytes' fields."
+            # TEST_FAILED might have already been set by the inner check, but ensure it is.
+            TEST_FAILED=1
+        elif [ "$HAS_GLOBAL_COUNTERS" -gt 0 ] && [ "$HAS_GLOBAL_QUIC_FIELDS" -eq 1 ]; then
+            echo "Global QUIC counter fields ('quic_pkts', 'quic_bytes') successfully found in global counters output."
+        fi
+
         if [ "$HAS_AGG_METADATA" -eq 0 ] && [ "$HAS_AGG_STATS" -eq 0 ] && [ "$HAS_GLOBAL_COUNTERS" -eq 0 ]; then
              echo "Warning: No standard aggregation output lines (metadata, stats, counters) found, though output file was not empty."
         fi

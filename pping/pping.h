@@ -337,6 +337,8 @@ struct global_counters {
 	__u64 icmp_bytes;
 	__u64 icmp6_pkts;
 	__u64 icmp6_bytes;
+	__u64 quic_pkts;             // Total QUIC packets observed
+	__u64 quic_bytes;            // Total QUIC bytes observed
 	__u32 other_ipprotos[N_IPPROTOS];
 };
 

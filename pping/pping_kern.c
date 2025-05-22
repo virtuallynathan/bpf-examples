@@ -391,7 +391,7 @@ static void update_ecn_counters(struct ecn_counters *counters, __u8 ecn)
 	}
 }
 
-static void update_global_counters(__u8 ipproto, __u32 pkt_len, __u8 ecn)
+static void update_global_counters(__u8 ipproto, __u32 pkt_len, __u8 ecn, bool is_quic_pkt)
 {
 	if (!config.agg_rtts)
 		return;
@@ -402,6 +402,16 @@ static void update_global_counters(__u8 ipproto, __u32 pkt_len, __u8 ecn)
 	counters = bpf_map_lookup_elem(&map_global_counters, &key);
 	if (!counters) // Should never happen
 		return;
+
+	if (is_quic_pkt) { // Check this first
+		counters->quic_pkts++;
+		counters->quic_bytes += pkt_len;
+		// Update ECN for QUIC packets if ecn is valid (ipproto will be IPPROTO_UDP here, which is > 0)
+		if (ipproto > 0) {
+			 update_ecn_counters(&counters->ecn, ecn);
+		}
+		return; // Counted as QUIC, do not process further as UDP
+	}
 
 	switch (ipproto) {
 	case 0: // Used to represent non-IP instead of IPv6 hop-by-hop
@@ -709,12 +719,21 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 			*(__be32 *)iph_ptr.ip6h & IPV6_FLOWINFO_MASK;
 		ecn = parse_ipv6_ecn(iph_ptr.ip6h);
 	}
-	update_global_counters(proto, p_info->pkt_len, ecn);
+	// is_quic will be set later if UDP, so pass false for now, then update if it's QUIC
+	// This call is primarily for IP-level stats, QUIC stats will be handled if p_info->is_quic is true later
+	// However, the new logic in update_global_counters expects is_quic_pkt.
+	// We need to call it *after* p_info->is_quic is determined.
+
+	// Defer update_global_counters call until after QUIC check for UDP.
+	// For non-UDP, p_info->is_quic will be false.
 
 	// Parse identifer from suitable protocol
 	err = -1;
 	// Initialize proto_info for each path to avoid using stale data
 	__builtin_memset(&proto_info, 0, sizeof(proto_info));
+	
+	// Default p_info->is_quic to false before specific protocol parsing
+	p_info->is_quic = false;
 
 	if (config.track_tcp && proto == IPPROTO_TCP)
 		err = parse_tcp_identifier(pctx, &transporth_ptr.tcph,
@@ -768,8 +787,12 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 	}
 
 
+	// Now call update_global_counters, p_info->is_quic is set if it was a QUIC packet
+	update_global_counters(proto, p_info->pkt_len, ecn, p_info->is_quic);
+
 	if (err) {
 		// Error parsing protocol, or no protocol matched (or not trackable UDP)
+		// If err is set, but it was a QUIC packet, it's already counted by update_global_counters
 		p_info->rtt_trackable = false;
 	} else {
 		// Sucessfully parsed packet identifier
@@ -793,7 +816,8 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 	return 0;
 
 err_not_ip:
-	update_global_counters(0, p_info->pkt_len, 0);
+	// For non-IP packets, is_quic is false.
+	update_global_counters(0, p_info->pkt_len, 0, false);
 	return -1;
 }
 
