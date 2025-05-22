@@ -181,6 +181,7 @@ static const struct option long_options[] = {
 	{ "aggregate-reverse",    no_argument,       NULL, ARG_AGG_REVERSE }, // Aggregate RTTs by dst IP of reply packet (instead of src like default)
 	{ "aggregate-timeout",    required_argument, NULL, AGG_ARG_TIMEOUT }, // Interval for timing out subnet entries in seconds (default 30s)
 	{ "write",                required_argument, NULL, 'w' }, // Write output to file (instead of stdout)
+	{ "quic",                 no_argument,       NULL, 'Q' }, // Calculate and report RTTs for QUIC traffic (spin bit)
 	{ 0, 0, NULL, 0 }
 };
 
@@ -285,12 +286,13 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 	config->bpf_config.localfilt = true;
 	config->bpf_config.track_tcp = false;
 	config->bpf_config.track_icmp = false;
+	config->bpf_config.track_quic = false;
 	config->bpf_config.skip_syn = true;
 	config->bpf_config.push_individual_events = true;
 	config->bpf_config.agg_rtts = false;
 	config->bpf_config.agg_by_dst = false;
 
-	while ((opt = getopt_long(argc, argv, "hflTCsi:r:R:t:c:F:I:x:a:4:6:w:",
+	while ((opt = getopt_long(argc, argv, "hflTCQsi:r:R:t:c:F:I:x:a:4:6:w:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
@@ -388,6 +390,9 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 		case 'C':
 			config->bpf_config.track_icmp = true;
 			break;
+		case 'Q':
+			config->bpf_config.track_quic = true;
+			break;
 		case 's':
 			config->bpf_config.skip_syn = false;
 			break;
@@ -470,6 +475,12 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 		return -EINVAL;
 	}
 
+	// Default protocol tracking
+	if (!config->bpf_config.track_tcp && !config->bpf_config.track_icmp && !config->bpf_config.track_quic) {
+		config->bpf_config.track_tcp = true;
+		config->bpf_config.track_quic = true;
+	}
+
 	config->bpf_config.ipv4_prefix_mask =
 		htonl(0xffffffffUL << (32 - config->agg_conf.ipv4_prefix_len));
 	config->bpf_config.ipv6_prefix_mask =
@@ -481,9 +492,24 @@ static int parse_arguments(int argc, char *argv[], struct pping_config *config)
 
 const char *tracked_protocols_to_str(struct pping_config *config)
 {
-	bool tcp = config->bpf_config.track_tcp;
-	bool icmp = config->bpf_config.track_icmp;
-	return tcp && icmp ? "TCP, ICMP" : tcp ? "TCP" : "ICMP";
+	static char buf[100]; // Static buffer to hold the string
+	buf[0] = '\0';
+	bool first = true;
+
+	if (config->bpf_config.track_tcp) {
+		strcat(buf, "TCP");
+		first = false;
+	}
+	if (config->bpf_config.track_icmp) {
+		if (!first) strcat(buf, ", ");
+		strcat(buf, "ICMP");
+		first = false;
+	}
+	if (config->bpf_config.track_quic) {
+		if (!first) strcat(buf, ", ");
+		strcat(buf, "QUIC");
+	}
+	return buf;
 }
 
 const char *output_format_to_str(enum pping_output_format format)
@@ -979,24 +1005,33 @@ static void print_ns_datetime(FILE *stream, __u64 monotonic_ns)
 	fprintf(stream, "%s.%09llu", timestr, ts % NS_PER_SECOND);
 }
 
-static void print_event_standard(FILE *stream, const union pping_event *e)
+static void print_event_standard(FILE *stream, const union pping_event *e, struct pping_config *g_config)
 {
 	char protostr[16];
+	const char *display_proto;
 
 	if (e->event_type == EVENT_TYPE_RTT) {
+		if (e->rtt_event.flow.proto == IPPROTO_UDP && g_config && g_config->bpf_config.track_quic) {
+			display_proto = "QUIC";
+		} else {
+			display_proto = ipproto_to_str(protostr, sizeof(protostr), e->rtt_event.flow.proto);
+		}
 		print_ns_datetime(stream, e->rtt_event.timestamp);
 		fprintf(stream, " %.6g ms %.6g ms %s ",
 			(double)e->rtt_event.rtt / NS_PER_MS,
 			(double)e->rtt_event.min_rtt / NS_PER_MS,
-			ipproto_to_str(protostr, sizeof(protostr),
-				       e->rtt_event.flow.proto));
+			display_proto);
 		print_flow_ppvizformat(stream, &e->rtt_event.flow);
 		fprintf(stream, "\n");
 	} else if (e->event_type == EVENT_TYPE_FLOW) {
+		// Assuming flow events for QUIC might also use IPPROTO_UDP
+		if (e->flow_event.flow.proto == IPPROTO_UDP && g_config && g_config->bpf_config.track_quic) {
+			display_proto = "QUIC";
+		} else {
+			display_proto = ipproto_to_str(protostr, sizeof(protostr), e->flow_event.flow.proto);
+		}
 		print_ns_datetime(stream, e->flow_event.timestamp);
-		fprintf(stream, " %s ",
-			ipproto_to_str(protostr, sizeof(protostr),
-				       e->rtt_event.flow.proto));
+		fprintf(stream, " %s ", display_proto);
 		print_flow_ppvizformat(stream, &e->flow_event.flow);
 		fprintf(stream, " %s due to %s from %s\n",
 			flowevent_to_str(e->flow_event.flow_event_type),
@@ -1022,25 +1057,30 @@ static void print_event_ppviz(FILE *stream, const union pping_event *e)
 }
 
 static void print_common_fields_json(json_writer_t *ctx,
-				     const union pping_event *e)
+				     const union pping_event *e, struct pping_config *g_config)
 {
-	const struct network_tuple *flow = &e->rtt_event.flow;
+	const struct network_tuple *flow = &e->rtt_event.flow; // Works for both rtt_event and flow_event as flow is the first common field
 	char saddr[INET6_ADDRSTRLEN];
 	char daddr[INET6_ADDRSTRLEN];
 	char protostr[16];
+	const char *display_proto;
+
+	if (flow->proto == IPPROTO_UDP && g_config && g_config->bpf_config.track_quic) {
+		display_proto = "QUIC";
+	} else {
+		display_proto = ipproto_to_str(protostr, sizeof(protostr), flow->proto);
+	}
 
 	format_ip_address(saddr, sizeof(saddr), flow->ipv, &flow->saddr.ip);
 	format_ip_address(daddr, sizeof(daddr), flow->ipv, &flow->daddr.ip);
 
 	jsonw_u64_field(ctx, "timestamp",
-			convert_monotonic_to_realtime(e->rtt_event.timestamp));
+			convert_monotonic_to_realtime(e->rtt_event.timestamp)); // e->rtt_event.timestamp is also common
 	jsonw_string_field(ctx, "src_ip", saddr);
 	jsonw_hu_field(ctx, "src_port", ntohs(flow->saddr.port));
 	jsonw_string_field(ctx, "dest_ip", daddr);
 	jsonw_hu_field(ctx, "dest_port", ntohs(flow->daddr.port));
-	jsonw_string_field(ctx, "protocol",
-			   ipproto_to_str(protostr, sizeof(protostr),
-					  flow->proto));
+	jsonw_string_field(ctx, "protocol", display_proto);
 }
 
 static void print_rttevent_fields_json(json_writer_t *ctx,
@@ -1064,13 +1104,13 @@ static void print_flowevent_fields_json(json_writer_t *ctx,
 	jsonw_string_field(ctx, "triggered_by", eventsource_to_str(fe->source));
 }
 
-static void print_event_json(struct output_context *out_ctx, const union pping_event *e)
+static void print_event_json(struct output_context *out_ctx, const union pping_event *e, struct pping_config *g_config)
 {
 	if (e->event_type != EVENT_TYPE_RTT && e->event_type != EVENT_TYPE_FLOW)
 		return;
 
 	jsonw_start_object(out_ctx->jctx);
-	print_common_fields_json(out_ctx->jctx, e);
+	print_common_fields_json(out_ctx->jctx, e, g_config);
 	if (e->event_type == EVENT_TYPE_RTT)
 		print_rttevent_fields_json(out_ctx->jctx, &e->rtt_event);
 	else // flow-event
@@ -1084,22 +1124,27 @@ static void print_event_json(struct output_context *out_ctx, const union pping_e
 	}
 }
 
+// Forward declaration for global config
+static struct pping_config global_config_for_handlers;
+
 static void print_event(struct output_context *out_ctx,
 			const union pping_event *pe)
 {
 	if (!out_ctx->stream)
 		return;
 
+	// Use global_config_for_handlers for printing functions
 	switch (out_ctx->format) {
 	case PPING_OUTPUT_STANDARD:
-		print_event_standard(out_ctx->stream, pe);
+		print_event_standard(out_ctx->stream, pe, &global_config_for_handlers);
 		break;
 	case PPING_OUTPUT_JSON:
 	case PPING_OUTPUT_JSONL:
 		if (out_ctx->jctx)
-			print_event_json(out_ctx, pe);
+			print_event_json(out_ctx, pe, &global_config_for_handlers);
 		break;
 	case PPING_OUTPUT_PPVIZ:
+		// ppviz doesn't show protocol string, so no change needed here for QUIC.
 		print_event_ppviz(out_ctx->stream, pe);
 		break;
 	}
@@ -1126,7 +1171,11 @@ static void print_map_clean_info(FILE *stream, const struct map_clean_event *e)
 
 static void handle_event(void *ctx, int cpu, void *data, __u32 data_size)
 {
-	struct output_context *out_ctx = *(struct output_context **)ctx;
+	// struct output_context *out_ctx = *(struct output_context **)ctx; // Original
+	// ctx actually holds struct pping_config * when perf_buffer__new is called in main.
+	// Let's assume it's pping_config for now.
+	struct pping_config *p_config = (struct pping_config *)ctx;
+	struct output_context *out_ctx = p_config->out_ctx;
 	const union pping_event *e = data;
 
 	if (data_size < sizeof(e->event_type))
@@ -2589,10 +2638,12 @@ int main(int argc, char *argv[])
 	struct perf_buffer *pb = NULL;
 	int epfd, sigfd, aggfd;
 
-	DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_ingress_opts);
-	DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_egress_opts);
+	// DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_ingress_opts); // Moved into global_config_for_handlers init
+	// DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_egress_opts); // Moved into global_config_for_handlers init
 
-	struct pping_config config = {
+	// Initialize global_config_for_handlers. Some fields will be set by parse_arguments.
+	// This makes it available to handlers like handle_event via the perf_buffer context.
+	global_config_for_handlers = (struct pping_config) {
 		.bpf_config = { .rate_limit = 100 * NS_PER_MS,
 				.rtt_rate = 0,
 				.use_srtt = false },
@@ -2614,8 +2665,35 @@ int main(int argc, char *argv[])
 		.event_map = "events",
 		.tc_ingress_opts = tc_ingress_opts,
 		.tc_egress_opts = tc_egress_opts,
+		.bpf_config = { .rate_limit = 100 * NS_PER_MS,
+				.rtt_rate = 0,
+				.use_srtt = false },
+		.clean_args = { .cleanup_interval = 1 * NS_PER_SECOND,
+				.valid_thread = false },
+		.agg_conf = { .aggregation_interval = 1 * NS_PER_SECOND,
+			      .timeout_interval = 30 * NS_PER_SECOND,
+			      .ipv4_prefix_len = 24,
+			      .ipv6_prefix_len = 48,
+			      .n_bins = RTT_AGG_NR_BINS,
+			      .bin_width = RTT_AGG_BIN_WIDTH },
+		.object_path = "pping_kern.o",
+		.ingress_prog = PROG_INGRESS_TC,
+		.egress_prog = PROG_EGRESS_TC,
+		.cleanup_ts_prog = "tsmap_cleanup",
+		.cleanup_flow_prog = "flowmap_cleanup",
+		.packet_map = "packet_ts",
+		.flow_map = "flow_state",
+		.event_map = "events",
+		.tc_ingress_opts = {0}, // Initialize with DECLARE_LIBBPF_OPTS style if needed, or ensure it's correctly setup
+		.tc_egress_opts = {0},  // Same here
 		.xdp_mode = XDP_MODE_NATIVE,
 	};
+	// Properly initialize tc_opts using the macro
+	DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_ingress_opts_val);
+	global_config_for_handlers.tc_ingress_opts = tc_ingress_opts_val;
+	DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_egress_opts_val);
+	global_config_for_handlers.tc_egress_opts = tc_egress_opts_val;
+
 
 	// Detect if running as root
 	if (geteuid() != 0) {
@@ -2631,7 +2709,7 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	err = parse_arguments(argc, argv, &config);
+	err = parse_arguments(argc, argv, &global_config_for_handlers);
 	if (err) {
 		fprintf(stderr, "Failed parsing arguments:  %s\n",
 			get_libbpf_strerror(err));
@@ -2639,31 +2717,31 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	if (!config.bpf_config.track_tcp && !config.bpf_config.track_icmp)
-		config.bpf_config.track_tcp = true;
+	// Default protocol handling moved to parse_arguments
 
-	if (config.format == PPING_OUTPUT_PPVIZ) {
-		if (config.bpf_config.agg_rtts) {
+	if (global_config_for_handlers.format == PPING_OUTPUT_PPVIZ) {
+		if (global_config_for_handlers.bpf_config.agg_rtts) {
 			fprintf(stderr,
 				"The ppviz format does not support aggregated output\n");
 			return EXIT_FAILURE;
 		}
-		if (config.bpf_config.track_icmp)
+		if (global_config_for_handlers.bpf_config.track_icmp) // QUIC also fine for ppviz as it is RTT
 			fprintf(stderr,
-				"Warning: ppviz format mainly intended for TCP traffic, but may now include ICMP traffic as well\n");
+				"Warning: ppviz format mainly intended for TCP traffic, but may now include ICMP/QUIC traffic as well\n");
 	}
 
 	fprintf(stderr, "Starting ePPing in %s mode tracking %s on %s\n",
-		output_format_to_str(config.format),
-		tracked_protocols_to_str(&config), config.ifname);
+		output_format_to_str(global_config_for_handlers.format),
+		tracked_protocols_to_str(&global_config_for_handlers), global_config_for_handlers.ifname);
 
-	config.out_ctx = open_output(
-		config.write_to_file ? config.filename : NULL, config.format,
-		config.bpf_config.agg_rtts ? &config.agg_conf : NULL);
-	if (!config.out_ctx) {
+	global_config_for_handlers.out_ctx = open_output(
+		global_config_for_handlers.write_to_file ? global_config_for_handlers.filename : NULL,
+		global_config_for_handlers.format,
+		global_config_for_handlers.bpf_config.agg_rtts ? &global_config_for_handlers.agg_conf : NULL);
+	if (!global_config_for_handlers.out_ctx) {
 		err = -errno;
 		fprintf(stderr, "Unable to open %s: %s\n",
-			config.write_to_file ? config.filename : "output",
+			global_config_for_handlers.write_to_file ? global_config_for_handlers.filename : "output",
 			get_libbpf_strerror(err));
 		return EXIT_FAILURE;
 	}
@@ -2676,30 +2754,31 @@ int main(int argc, char *argv[])
 		goto cleanup_output;
 	}
 
-	err = load_attach_bpfprogs(&obj, &config);
+	err = load_attach_bpfprogs(&obj, &global_config_for_handlers);
 	if (err) {
 		fprintf(stderr,
 			"Failed loading and attaching BPF programs in %s\n",
-			config.object_path);
+			global_config_for_handlers.object_path);
 		goto cleanup_sigfd;
 	}
 
-	err = setup_periodical_map_cleaning(obj, &config);
+	err = setup_periodical_map_cleaning(obj, &global_config_for_handlers);
 	if (err) {
 		fprintf(stderr, "Failed setting up map cleaning: %s\n",
 			get_libbpf_strerror(err));
 		goto cleanup_attached_progs;
 	}
 
-	err = init_perfbuffer(obj, &config, &pb);
+	// Pass address of global_config_for_handlers to perf_buffer__new's ctx argument
+	err = init_perfbuffer(obj, &global_config_for_handlers, &pb);
 	if (err) {
 		fprintf(stderr, "Failed setting up perf-buffer: %s\n",
 			get_libbpf_strerror(err));
 		goto cleanup_mapcleaning;
 	}
 
-	if (config.bpf_config.agg_rtts) {
-		aggfd = init_aggregation_timer(obj, &config);
+	if (global_config_for_handlers.bpf_config.agg_rtts) {
+		aggfd = init_aggregation_timer(obj, &global_config_for_handlers);
 		if (aggfd < 0) {
 			fprintf(stderr,
 				"Failed setting up aggregation timerfd: %s\n",
@@ -2717,7 +2796,7 @@ int main(int argc, char *argv[])
 		goto cleanup_aggfd;
 	}
 
-	err = epoll_add_events(epfd, pb, sigfd, config.clean_args.pipe_rfd, aggfd);
+	err = epoll_add_events(epfd, pb, sigfd, global_config_for_handlers.clean_args.pipe_rfd, aggfd);
 	if (err) {
 		fprintf(stderr, "Failed adding events to epoll instace: %s\n",
 			get_libbpf_strerror(err));
@@ -2726,7 +2805,7 @@ int main(int argc, char *argv[])
 
 	// Main loop
 	while (true) {
-		err = epoll_poll_events(epfd, &config, pb, -1);
+		err = epoll_poll_events(epfd, &global_config_for_handlers, pb, -1);
 		if (err) {
 			if (err == PPING_ABORT)
 				err = 0;
@@ -2749,37 +2828,37 @@ cleanup_perf_buffer:
 	perf_buffer__free(pb);
 
 cleanup_mapcleaning:
-	if (config.clean_args.valid_thread) {
-		pthread_cancel(config.clean_args.tid);
-		pthread_join(config.clean_args.tid, &thread_err);
+	if (global_config_for_handlers.clean_args.valid_thread) {
+		pthread_cancel(global_config_for_handlers.clean_args.tid);
+		pthread_join(global_config_for_handlers.clean_args.tid, &thread_err);
 		if (thread_err != PTHREAD_CANCELED)
-			err = err ? err : config.clean_args.err;
+			err = err ? err : global_config_for_handlers.clean_args.err;
 
-		bpf_link__destroy(config.clean_args.tsclean_link);
-		bpf_link__destroy(config.clean_args.flowclean_link);
+		bpf_link__destroy(global_config_for_handlers.clean_args.tsclean_link);
+		bpf_link__destroy(global_config_for_handlers.clean_args.flowclean_link);
 	}
-	close(config.clean_args.pipe_rfd);
-	close(config.clean_args.pipe_wfd);
+	close(global_config_for_handlers.clean_args.pipe_rfd);
+	close(global_config_for_handlers.clean_args.pipe_wfd);
 
 cleanup_attached_progs:
-	if (config.xdp_prog)
-		detach_err = xdp_detach(config.xdp_prog, config.ifindex,
-					config.xdp_mode);
+	if (global_config_for_handlers.xdp_prog)
+		detach_err = xdp_detach(global_config_for_handlers.xdp_prog, global_config_for_handlers.ifindex,
+					global_config_for_handlers.xdp_mode);
 	else
-		detach_err = tc_detach(config.ifindex, BPF_TC_INGRESS,
-				       &config.tc_ingress_opts, false);
+		detach_err = tc_detach(global_config_for_handlers.ifindex, BPF_TC_INGRESS,
+				       &global_config_for_handlers.tc_ingress_opts, false);
 	if (detach_err)
 		fprintf(stderr,
 			"Failed removing ingress program from interface %s: %s\n",
-			config.ifname, get_libbpf_strerror(detach_err));
+			global_config_for_handlers.ifname, get_libbpf_strerror(detach_err));
 
 	detach_err =
-		tc_detach(config.ifindex, BPF_TC_EGRESS, &config.tc_egress_opts,
-			  config.force && config.created_tc_hook);
+		tc_detach(global_config_for_handlers.ifindex, BPF_TC_EGRESS, &global_config_for_handlers.tc_egress_opts,
+			  global_config_for_handlers.force && global_config_for_handlers.created_tc_hook);
 	if (detach_err)
 		fprintf(stderr,
 			"Failed removing egress program from interface %s: %s\n",
-			config.ifname, get_libbpf_strerror(detach_err));
+			global_config_for_handlers.ifname, get_libbpf_strerror(detach_err));
 
 	bpf_object__close(obj);
 
@@ -2787,7 +2866,7 @@ cleanup_sigfd:
 	close(sigfd);
 
 cleanup_output:
-	close_output(config.out_ctx);
+	close_output(global_config_for_handlers.out_ctx);
 
 	return err != 0 || detach_err != 0;
 }

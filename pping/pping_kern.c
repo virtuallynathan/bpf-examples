@@ -10,6 +10,7 @@
 #include <linux/tcp.h>
 #include <linux/icmp.h>
 #include <linux/icmpv6.h>
+#include <linux/udp.h>
 #include <stdbool.h>
 #include <errno.h>
 
@@ -45,6 +46,7 @@
 #define UNOPENED_FLOW_LIFETIME (30 * NS_PER_SECOND) // Clear out flows that have not seen a response after this long
 
 #define MAX_MEMCMP_SIZE 128
+#define QUIC_RTT_REJECTION_THRESHOLD_FACTOR 5
 
 /*
  * Structs for map iteration programs
@@ -78,39 +80,6 @@ struct parsing_context {
 };
 
 /*
- * Struct filled in by parse_packet_id.
- *
- * Note: As long as parse_packet_id is successful, the flow-parts of pid
- * and reply_pid should be valid, regardless of value for pid_valid and
- * reply_pid valid. The *pid_valid members are there to indicate that the
- * identifier part of *pid are valid and can be used for timestamping/lookup.
- * The reason for not keeping the flow parts as an entirely separate members
- * is to save some performance by avoid doing a copy for lookup/insertion
- * in the packet_ts map.
- */
-struct packet_info {
-	__u64 time;                  // Arrival time of packet
-	__u32 pkt_len;               // Size of packet (including headers)
-	__u32 payload;               // Size of packet data (excluding headers)
-	struct packet_id pid;        // flow + identifier to timestamp (ex. TSval)
-	struct packet_id reply_pid;  // rev. flow + identifier to match against (ex. TSecr)
-	__u32 ingress_ifindex;       // Interface packet arrived on (if is_ingress, otherwise not valid)
-	union {                      // The IP-level "type of service" (DSCP for IPv4, traffic class + flow label for IPv6)
-		__u8 ipv4_tos;
-		__be32 ipv6_tos;
-	} ip_tos;
-	__u16 ip_len;                // The IPv4 total length or IPv6 payload length
-	bool is_ingress;             // Packet on egress or ingress?
-	bool pid_flow_is_dfkey;      // Used to determine which member of dualflow state to use for forward direction
-	bool pid_valid;              // identifier can be used to timestamp packet
-	bool reply_pid_valid;        // reply_identifier can be used to match packet
-	enum flow_event_type event_type; // flow event triggered by packet
-	enum flow_event_reason event_reason; // reason for triggering flow event
-	bool wait_first_edge;        // Do we need to wait for the first identifier change before timestamping?
-	bool rtt_trackable;          // Packet of type we can track RTT for
-};
-
-/*
  * Struct filled in by protocol id parsers (ex. parse_tcp_identifier)
  */
 struct protocol_info {
@@ -121,6 +90,16 @@ struct protocol_info {
 	enum flow_event_type event_type;
 	enum flow_event_reason event_reason;
 	bool wait_first_edge;
+};
+
+/*
+ * QUIC short header representation
+ * For now, we only care about the spin bit.
+ * Assuming spin bit is the 3rd bit (0-indexed) of the first byte.
+ */
+struct quic_short_header {
+	__u8 flags; // First byte of QUIC short header
+	__u8 spin_bit;
 };
 
 char _license[] SEC("license") = "GPL";
@@ -263,6 +242,54 @@ static int my_memcmp(const void *s1_, const void *s2_, __u32 size)
 		if (s1[i] != s2[i])
 			return s1[i] > s2[i] ? 1 : -1;
 	}
+
+	return 0;
+}
+
+/*
+ * Attempts to parse the QUIC short header from a UDP packet.
+ *
+ * If successful, out_quic_hdr will be populated and 0 will be returned.
+ * On failure -1 will be returned.
+ */
+static inline int parse_quic_header(struct hdr_cursor *nh, void *data_end,
+				    struct quic_short_header **out_quic_hdr,
+				    __u16 *udp_sport, __u16 *udp_dport)
+{
+	struct udphdr *udph;
+	struct quic_short_header *quic_hdr;
+
+	// Parse UDP header
+	if (parse_udphdr(nh, data_end, &udph) < 0)
+		return -1;
+
+	// Check for UDP port 443 (QUIC)
+	if (udph->source != bpf_htons(443) && udph->dest != bpf_htons(443))
+		return -1;
+
+	*udp_sport = udph->source;
+	*udp_dport = udph->dest;
+
+	// Check if there's enough data for QUIC header (at least 1 byte for flags)
+	if (nh->pos + sizeof(struct quic_short_header) > data_end) // Adjusted to check for the whole struct, though we only use 1 byte for now.
+		return -1;
+
+	quic_hdr = (struct quic_short_header *)nh->pos;
+
+	// Ensure the memory for quic_hdr (at least the flags byte) is accessible
+	if ((void *)quic_hdr + sizeof(__u8) > data_end) // Check for the first byte
+		return -1;
+
+	// Extract spin bit (assuming it's the 3rd bit (0-indexed) of the first byte)
+	// The QUIC specification states the spin bit is the 3rd MSB of the first octet
+	// which is bit 5 if 0-indexed from LSB (00100000)
+	quic_hdr->spin_bit = (quic_hdr->flags & 0x20) >> 5;
+
+	*out_quic_hdr = quic_hdr;
+	// Advance the header cursor past the QUIC header (minimal: 1 byte for flags)
+	// For now, let's assume the useful part of QUIC header for this function is just the first byte.
+	// A real QUIC header is much longer.
+	nh->pos = (void *)quic_hdr + sizeof(__u8); // Advance past the flags byte.
 
 	return 0;
 }
@@ -686,6 +713,9 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 
 	// Parse identifer from suitable protocol
 	err = -1;
+	// Initialize proto_info for each path to avoid using stale data
+	__builtin_memset(&proto_info, 0, sizeof(proto_info));
+
 	if (config.track_tcp && proto == IPPROTO_TCP)
 		err = parse_tcp_identifier(pctx, &transporth_ptr.tcph,
 					   &p_info->pid.flow.saddr.port,
@@ -703,9 +733,43 @@ static int parse_packet_identifier(struct parsing_context *pctx,
 					    &p_info->pid.flow.saddr.port,
 					    &p_info->pid.flow.daddr.port,
 					    &proto_info);
+	else if (proto == IPPROTO_UDP) {
+		// Try to parse as QUIC
+		struct quic_short_header *quic_hdr = NULL;
+		__u16 quic_udp_sport = 0, quic_udp_dport = 0;
+		struct hdr_cursor quic_nh = pctx->nh; // Use a copy of the cursor
+
+		if (parse_quic_header(&quic_nh, pctx->data_end, &quic_hdr, &quic_udp_sport, &quic_udp_dport) == 0 && quic_hdr) {
+			p_info->is_quic = true;
+			p_info->quic_spin_bit = quic_hdr->spin_bit;
+			p_info->pid.flow.saddr.port = quic_udp_sport;
+			p_info->pid.flow.daddr.port = quic_udp_dport;
+			
+			// For QUIC, we don't have a traditional PID like TCP TSVAL or ICMP Seq.
+			// We can use a placeholder or leave it 0. For now, let's use 0.
+			// The spin bit itself is not the identifier for matching pairs.
+			p_info->pid.identifier = 0; 
+			p_info->reply_pid.identifier = 0;
+
+			p_info->pid_valid = true; // Packet has an identifier (even if 0, flow is valid)
+			p_info->reply_pid_valid = false; // No reply matching based on spin bit alone
+			
+			p_info->event_type = FLOW_EVENT_NONE;
+			p_info->event_reason = EVENT_REASON_NONE;
+			p_info->wait_first_edge = false; // Spin bit is read directly
+
+			p_info->rtt_trackable = true; // Mark as trackable for now
+			pctx->nh = quic_nh; // Commit cursor advancement
+			err = 0; // Success
+		} else {
+			// Not a QUIC packet we can parse, or parsing failed.
+			// err remains -1, p_info->rtt_trackable will be false.
+		}
+	}
+
 
 	if (err) {
-		// Error parsing protocol, or no protocol matched
+		// Error parsing protocol, or no protocol matched (or not trackable UDP)
 		p_info->rtt_trackable = false;
 	} else {
 		// Sucessfully parsed packet identifier
@@ -920,12 +984,16 @@ static void init_flowstate(struct flow_state *f_state,
 					  p_info->event_reason :
 						EVENT_REASON_FIRST_OBS_PCKT;
 	f_state->has_been_timestamped = false;
+	f_state->prev_quic_spin_bit = 0xFF; // Initialize QUIC spin bit as unseen
+	f_state->last_spin_edge_ts = 0;     // Initialize last spin edge timestamp
 }
 
 static void init_empty_flowstate(struct flow_state *f_state)
 {
 	f_state->conn_state = CONNECTION_STATE_EMPTY;
 	f_state->has_been_timestamped = false;
+	f_state->prev_quic_spin_bit = 0xFF; // Initialize QUIC spin bit as unseen
+	f_state->last_spin_edge_ts = 0;     // Initialize last spin edge timestamp
 }
 
 /*
@@ -1321,21 +1389,66 @@ static void pping_parsed_packet(void *ctx, struct packet_info *p_info)
 	struct aggregated_stats *src_stats = NULL, *dst_stats = NULL;
 
 	update_aggregate_stats(&src_stats, &dst_stats, p_info);
-	if (!p_info->rtt_trackable)
+
+	// QUIC RTT logic is handled before the general rtt_trackable check
+	// because it has its own conditions for trackability based on spin bit.
+	if (p_info->is_quic) {
+		df_state = lookup_or_create_dualflow_state(ctx, p_info);
+		if (df_state) {
+			struct flow_state *f_state = get_flowstate_from_packet(df_state, p_info);
+
+			if (f_state->last_spin_edge_ts == 0) { // First QUIC packet for this flow or state reset
+				f_state->prev_quic_spin_bit = p_info->quic_spin_bit;
+				f_state->last_spin_edge_ts = p_info->time;
+			} else if (p_info->quic_spin_bit != f_state->prev_quic_spin_bit) { // Spin edge detected
+				// last_spin_edge_ts should be > 0 here from the previous condition
+				__s64 rtt = p_info->time - f_state->last_spin_edge_ts; // Use signed for safety, though time should always advance
+
+				// Update edge timestamp and previous spin bit regardless of RTT validity for the next measurement
+				f_state->last_spin_edge_ts = p_info->time;
+				f_state->prev_quic_spin_bit = p_info->quic_spin_bit;
+
+				if (rtt >= 0) {
+					// Heuristic: Reject RTT if it's much larger than srtt
+					if (f_state->srtt > 0 && (__u64)rtt > f_state->srtt * QUIC_RTT_REJECTION_THRESHOLD_FACTOR) {
+						// RTT sample rejected, do nothing with it for stats/events
+					} else {
+						// RTT sample is good, update stats and send event
+						if (f_state->min_rtt == 0 || (__u64)rtt < f_state->min_rtt)
+							f_state->min_rtt = (__u64)rtt;
+						f_state->srtt = calculate_srtt(f_state->srtt, (__u64)rtt);
+						send_rtt_event(ctx, (__u64)rtt, f_state, p_info);
+						aggregate_rtt((__u64)rtt, config.agg_by_dst ? dst_stats : src_stats);
+					}
+				}
+			}
+			// If no spin edge, prev_quic_spin_bit and last_spin_edge_ts remain unchanged (last_spin_edge_ts not updated).
+		}
+	}
+
+	if (!p_info->rtt_trackable && !p_info->is_quic) // If it's QUIC, we've handled RTT. If not QUIC, check rtt_trackable for other protocols.
 		return;
+	// If it IS QUIC, we allow it to proceed to flow state updates etc., but skip the generic timestamp/match logic if not needed.
 
 	df_state = lookup_or_create_dualflow_state(ctx, p_info);
 	if (!df_state)
 		return;
 
 	fw_flow = get_flowstate_from_packet(df_state, p_info);
-	update_forward_flowstate(p_info, fw_flow);
-	pping_timestamp_packet(fw_flow, ctx, p_info);
+	update_forward_flowstate(p_info, fw_flow); // Updates sent_pkts/bytes
 
 	rev_flow = get_reverse_flowstate_from_packet(df_state, p_info);
-	update_reverse_flowstate(ctx, p_info, rev_flow);
-	pping_match_packet(rev_flow, ctx, p_info,
-			   config.agg_by_dst ? dst_stats : src_stats);
+	update_reverse_flowstate(ctx, p_info, rev_flow); // Updates rec_pkts/bytes, handles flow open event
+
+	// For non-QUIC trackable flows, or if QUIC flows also use this (currently not how spin RTT works)
+	if (p_info->rtt_trackable && !p_info->is_quic) { // Standard TCP/ICMP RTT logic
+		pping_timestamp_packet(fw_flow, ctx, p_info);
+		pping_match_packet(rev_flow, ctx, p_info,
+				   config.agg_by_dst ? dst_stats : src_stats);
+	}
+	// If p_info->is_quic is true, the RTT logic specific to QUIC spin bit was handled above.
+	// We don't call pping_timestamp_packet or pping_match_packet for QUIC spin bit RTT
+	// as it doesn't use the packet_ts map or pid.identifier for matching.
 
 	close_and_delete_flows(ctx, p_info, fw_flow, rev_flow);
 }

@@ -102,6 +102,7 @@ struct bpf_config {
 	bool push_individual_events;
 	bool agg_rtts;
 	bool agg_by_dst; // dst of reply packet
+	bool track_quic; // track QUIC RTT via spin bit
 };
 
 struct ipprefix_key {
@@ -151,6 +152,9 @@ struct flow_state {
 	enum flow_event_reason opening_reason;
 	bool has_been_timestamped;
 	__u8 reserved[5];
+	// QUIC spin bit tracking
+	__u8 prev_quic_spin_bit;     // Previously observed QUIC spin bit
+	__u64 last_spin_edge_ts;     // Timestamp of the last observed spin edge
 };
 
 /*
@@ -167,6 +171,41 @@ struct dual_flow_state {
 struct packet_id {
 	struct network_tuple flow;
 	__u32 identifier; //tsval for TCP packets
+};
+
+/*
+ * Struct filled in by parse_packet_identifier.
+ *
+ * Note: As long as parse_packet_identifier is successful, the flow-parts of pid
+ * and reply_pid should be valid, regardless of value for pid_valid and
+ * reply_pid valid. The *pid_valid members are there to indicate that the
+ * identifier part of *pid are valid and can be used for timestamping/lookup.
+ * The reason for not keeping the flow parts as an entirely separate members
+ * is to save some performance by avoid doing a copy for lookup/insertion
+ * in the packet_ts map.
+ */
+struct packet_info {
+	__u64 time;                  // Arrival time of packet
+	__u32 pkt_len;               // Size of packet (including headers)
+	__u32 payload;               // Size of packet data (excluding headers)
+	struct packet_id pid;        // flow + identifier to timestamp (ex. TSval)
+	struct packet_id reply_pid;  // rev. flow + identifier to match against (ex. TSecr)
+	__u32 ingress_ifindex;       // Interface packet arrived on (if is_ingress, otherwise not valid)
+	union {                      // The IP-level "type of service" (DSCP for IPv4, traffic class + flow label for IPv6)
+		__u8 ipv4_tos;
+		__be32 ipv6_tos;
+	} ip_tos;
+	__u16 ip_len;                // The IPv4 total length or IPv6 payload length
+	bool is_ingress;             // Packet on egress or ingress?
+	bool pid_flow_is_dfkey;      // Used to determine which member of dualflow state to use for forward direction
+	bool pid_valid;              // identifier can be used to timestamp packet
+	bool reply_pid_valid;        // reply_identifier can be used to match packet
+	enum flow_event_type event_type; // flow event triggered by packet
+	enum flow_event_reason event_reason; // reason for triggering flow event
+	bool wait_first_edge;        // Do we need to wait for the first identifier change before timestamping?
+	bool rtt_trackable;          // Packet of type we can track RTT for
+	bool is_quic;                // True if UDP packet is identified as QUIC
+	__u8 quic_spin_bit;          // Extracted QUIC spin bit
 };
 
 
